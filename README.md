@@ -25,6 +25,7 @@
 - [系统架构](#系统架构)
 - [功能演示](#功能演示)
 - [快速开始](#快速开始)
+- [可观测性](#可观测性)
 - [会话持久化](#会话持久化)
 - [测试体系](#测试体系)
 - [流式协议](#流式协议)
@@ -61,6 +62,7 @@
 | 🎫 | **工单槽位填充** | 三必需参数（`user_id` / `issue_type` / `description`）校验；缺参**禁止**调用工具，改为亲切反问 |
 | ⚡ | **SSE 流式推送** | `token` / `tool_start` / `tool_end` / `error` / `done` 五类事件，工具生命周期对前端完全透明 |
 | 🖥️ | **零构建前端** | 单文件原生 HTML + JS，**无 Node.js / npm / 打包步骤**；打字机渲染 + 可折叠工具卡片 |
+| 🔭 | **可观测性** | 结构化日志（JSON/console）+ 请求 ID 全链路透传 + 可选 LangSmith 追踪 |
 | 💾 | **持久化会话** | 默认 SQLite 落盘（WAL），进程重启不丢上下文，多 worker 共享同一份状态 |
 | 🧩 | **离线自愈** | 未配置 API Key 时自动切换确定性 mock 模型，**图结构与路由仍可完整验证** |
 | 🔒 | **密钥防护** | 自研扫描器（9 类强特征 + 熵值弱特征）+ pre-commit 钩子 + CI 兜底，三层拦截 |
@@ -392,7 +394,7 @@ python -m src.api.main
 **方式一：自动化测试（推荐，含断言）**
 
 ```bash
-pytest                    # 89 个用例，默认离线（mock 模型），约 8 秒
+pytest                    # 123 个用例，默认离线（mock 模型），约 8 秒
 pytest -m real_model      # 额外验证真实 qwen-plus 是否遵守 Prompt（需 API Key）
 ```
 
@@ -428,6 +430,77 @@ CUSTOMER_AGENT_MOCK=1 python -m src.api.main
 
 # Windows PowerShell
 $env:CUSTOMER_AGENT_MOCK="1"; python -m src.api.main
+```
+
+---
+
+## 🔭 可观测性
+
+### 结构化日志
+
+服务端输出统一走标准库 `logging`，默认输出到 **stderr**（stdout 留给业务输出）：
+
+```ini
+LOG_LEVEL=INFO        # DEBUG / INFO / WARNING / ERROR
+LOG_FORMAT=console    # console（人类可读）| json（采集友好）
+```
+
+`json` 格式每行一个对象，可直接被 ELK / Loki / CloudWatch 解析：
+
+```json
+{"timestamp": "2026-09-14 15:33:50", "level": "INFO", "logger": "esa.api", "message": "请求完成", "request_id": "req-9739734ec543", "thread_id": "-", "method": "POST", "path": "/api/chat", "status": 200, "duration_ms": 36.63}
+```
+
+### 请求 ID 全链路透传
+
+每个请求都会绑定一个 `request_id`（基于 `contextvars`，并发请求之间自动隔离），
+**该请求产生的每一条日志都会自动带上它**，无需逐层传参：
+
+* 调用方可传入 `X-Request-ID` 复用（便于跨服务串联链路），未传则自动生成；
+* 响应头回传 `X-Request-ID`，前端可据此上报问题、直接定位日志。
+
+```console
+$ curl -si -X POST http://127.0.0.1:8000/api/chat \
+    -H "Content-Type: application/json" \
+    -d '{"message":"你好"}' | grep -i x-request-id
+X-Request-ID: req-9739734ec543
+```
+
+### 链路追踪（可选）
+
+结构化日志能回答「发生了什么」，但回答不了「**模型那一步为什么这么决策**」。
+开启 LangSmith 追踪后可看到每一步的输入输出、耗时与 token 消耗：
+
+```ini
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_pt_xxxxxxxxxxxx
+LANGSMITH_PROJECT=enterprise-service-agent
+```
+
+| 特性 | 说明 |
+|---|---|
+| **默认关闭** | 未配置 API Key 时完全不启用，零开销；开关打开但缺 Key 也会被判定为未启用，避免上传失败刷屏 |
+| **元数据可检索** | `request_id` / `thread_id` 会作为 trace metadata，可按会话或请求精确定位 |
+| **兼容旧变量** | 同时支持 `LANGCHAIN_TRACING_V2` / `LANGCHAIN_API_KEY` / `LANGCHAIN_PROJECT` |
+| **状态可查** | `GET /health` 的 `tracing` 字段报告启用状态与未启用原因 |
+
+> ⚠️ **隐私提醒**：开启追踪后**对话内容、工具入参与返回结果都会上传到 LangSmith**。
+> 生产环境启用前请确认符合你所在组织的合规要求；如需脱敏，应自定义
+> `langsmith.Client(hide_inputs=...)` 或在应用层先行脱敏。
+
+### 健康探针
+
+```console
+$ curl -s http://127.0.0.1:8000/health
+{
+  "status": "ok",
+  "graph_ready": true,
+  "model_mode": "dashscope",
+  "checkpoint_backend": "sqlite",
+  "checkpoint_degraded": null,
+  "tracing": {"enabled": false, "project": null, "has_api_key": false,
+              "reason": "未启用（默认关闭，未配置 LANGSMITH_API_KEY）"}
+}
 ```
 
 ---
@@ -492,7 +565,7 @@ $ curl -s http://127.0.0.1:8000/health
 ## 🧪 测试体系
 
 ```bash
-pytest                    # 89 个用例，默认离线，约 8 秒
+pytest                    # 123 个用例，默认离线，约 8 秒
 pytest -v                 # 显示用例名
 pytest -m real_model      # 额外跑真实模型用例（需 API Key）
 ```
@@ -503,6 +576,7 @@ pytest -m real_model      # 额外跑真实模型用例（需 API Key）
 | 状态机 | `tests/test_agent_graph.py` | 路由层单测 + **黄金用例** + 多轮上下文 |
 | API | `tests/test_api.py` | HTTP 路由、入参校验、**SSE 事件协议契约**、前端契约 |
 | 持久化 | `tests/test_checkpointer.py` | 后端选择、WAL、**跨重启/多 worker 状态保留**、降级 |
+| 可观测性 | `tests/test_observability.py` | 上下文隔离、日志格式与注入、追踪开关、**trace 元数据透传**、请求 ID 中间件 |
 
 ### 黄金用例：把已验证的行为固化下来
 
@@ -605,6 +679,10 @@ enterprise-service-agent/
 │       └── refund_policy.md        退款政策与工单流转规范
 │
 ├── src/
+│   ├── observability/              🔭 可观测性（日志 / 上下文 / 追踪）
+│   │   ├── logging.py                 结构化日志（JSON / console）
+│   │   ├── context.py                 请求上下文（request_id / thread_id）
+│   │   └── tracing.py                 链路追踪（可选 LangSmith）
 │   ├── tools/
 │   │   └── customer_service_tools.py   🔧 @tool 业务工具
 │   ├── agent/
@@ -615,7 +693,7 @@ enterprise-service-agent/
 │       ├── smoke_sse.py                🧪 流式接口冒烟脚本（目视，无断言）
 │       └── static/index.html           🖥️ Web 工作台（单文件，零构建）
 │
-├── tests/                              ✅ pytest 套件（89 用例，默认离线）
+├── tests/                              ✅ pytest 套件（123 用例，默认离线）
 │   ├── README.md                       测试说明与编写约定
 │   ├── conftest.py                     共享 fixtures（模型桩、图实例）
 │   ├── test_tools.py                   工具契约
@@ -777,7 +855,7 @@ python scripts/secret_scan.py --history      # 扫全部历史提交
 | 多轮上下文 | 同 `thread_id` 跨轮槽位累积，历史 4 条消息完整保留 |
 | 异常兜底 | 强制 `astream` 抛错 → 正确推送 `{"type":"error"}` |
 | 参数校验 | 空 `message` → HTTP 422 |
-| **pytest 套件** | **89 用例通过**（默认 mock 离线）；真实模型用例 **3 用例通过** |
+| **pytest 套件** | **123 用例通过**（默认 mock 离线）；真实模型用例 **3 用例通过** |
 | 密钥扫描器 | 6 类真实密钥样本全部拦截；`your_key_here` 等占位符零误报 |
 | 仓库密钥自检 | `--all` 与 `--history` 均通过 —— **密钥从未进入 git 历史** |
 

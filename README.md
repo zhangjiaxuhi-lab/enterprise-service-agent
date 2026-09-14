@@ -25,6 +25,7 @@
 - [系统架构](#系统架构)
 - [功能演示](#功能演示)
 - [快速开始](#快速开始)
+- [会话持久化](#会话持久化)
 - [测试体系](#测试体系)
 - [流式协议](#流式协议)
 - [项目结构](#项目结构)
@@ -60,6 +61,7 @@
 | 🎫 | **工单槽位填充** | 三必需参数（`user_id` / `issue_type` / `description`）校验；缺参**禁止**调用工具，改为亲切反问 |
 | ⚡ | **SSE 流式推送** | `token` / `tool_start` / `tool_end` / `error` / `done` 五类事件，工具生命周期对前端完全透明 |
 | 🖥️ | **零构建前端** | 单文件原生 HTML + JS，**无 Node.js / npm / 打包步骤**；打字机渲染 + 可折叠工具卡片 |
+| 💾 | **持久化会话** | 默认 SQLite 落盘（WAL），进程重启不丢上下文，多 worker 共享同一份状态 |
 | 🧩 | **离线自愈** | 未配置 API Key 时自动切换确定性 mock 模型，**图结构与路由仍可完整验证** |
 | 🔒 | **密钥防护** | 自研扫描器（9 类强特征 + 熵值弱特征）+ pre-commit 钩子 + CI 兜底，三层拦截 |
 
@@ -390,7 +392,7 @@ python -m src.api.main
 **方式一：自动化测试（推荐，含断言）**
 
 ```bash
-pytest                    # 71 个用例，默认离线（mock 模型），约 8 秒
+pytest                    # 89 个用例，默认离线（mock 模型），约 8 秒
 pytest -m real_model      # 额外验证真实 qwen-plus 是否遵守 Prompt（需 API Key）
 ```
 
@@ -430,10 +432,67 @@ $env:CUSTOMER_AGENT_MOCK="1"; python -m src.api.main
 
 ---
 
+## 💾 会话持久化
+
+会话状态（消息历史）默认通过 **SQLite 落盘**，而非保存在进程内存里。
+
+```ini
+# .env
+CHECKPOINT_BACKEND=sqlite                          # sqlite（默认）| memory
+CHECKPOINT_DB_PATH=data/runtime/checkpoints.db     # 相对项目根目录；已加入 .gitignore
+```
+
+### 为什么必须持久化
+
+内存检查点（`MemorySaver`）会带来两个**生产级故障**：
+
+| 问题 | 后果 |
+|---|---|
+| 进程重启即丢上下文 | 用户进行到一半的多轮工单流程被打断，必须重新描述 |
+| 多 worker 部署直接失效 | 同一会话的下一轮请求落到另一个进程时，该进程没有历史，槽位填充退化为「首次对话」——**重新反问、丢失诉求** |
+
+SQLite 后端启用 **WAL 模式**，因此多个 worker 进程可安全共享同一份会话状态。
+
+### 验证跨重启保留
+
+```bash
+pytest tests/test_checkpointer.py -v
+```
+
+该模块覆盖：后端选择与环境变量解析、WAL 启用、**跨重启状态恢复**、
+**模拟多 worker 的连续补槽**、线程隔离、以及降级行为。其中一条用例专门确认
+`memory` 后端**不会**跨实例保留状态 —— 用于证明上述用例确有区分度。
+
+### 降级行为
+
+SQLite 初始化失败（目录只读、磁盘满等）时**自动降级为内存模式**，
+而不是启动失败；但降级**不会静默**，原因会通过健康探针暴露：
+
+```console
+$ curl -s http://127.0.0.1:8000/health
+{
+  "status": "ok",
+  "graph_ready": true,
+  "checkpoint_backend": "sqlite",
+  "checkpoint_degraded": null
+}
+```
+
+> 若 `checkpoint_degraded` 非空，说明当前为无持久化运行 —— 容器探针应据此告警。
+
+### 一个实现细节（易踩坑）
+
+`AsyncSqliteSaver` **只支持异步接口**。在异步上下文中调用同步的
+`graph.get_state(...)` 会抛 `InvalidStateError`，必须改用 `await graph.aget_state(...)`。
+`/api/chat/history/{thread_id}` 已按此实现。需要同步访问的场景（CLI 脚本）
+请使用 `build_sync_checkpointer(backend="memory")`。
+
+---
+
 ## 🧪 测试体系
 
 ```bash
-pytest                    # 71 个用例，默认离线，约 8 秒
+pytest                    # 89 个用例，默认离线，约 8 秒
 pytest -v                 # 显示用例名
 pytest -m real_model      # 额外跑真实模型用例（需 API Key）
 ```
@@ -443,6 +502,7 @@ pytest -m real_model      # 额外跑真实模型用例（需 API Key）
 | 工具契约 | `tests/test_tools.py` | 参数校验、输出格式、检索正确性、**缺参不得静默成功** |
 | 状态机 | `tests/test_agent_graph.py` | 路由层单测 + **黄金用例** + 多轮上下文 |
 | API | `tests/test_api.py` | HTTP 路由、入参校验、**SSE 事件协议契约**、前端契约 |
+| 持久化 | `tests/test_checkpointer.py` | 后端选择、WAL、**跨重启/多 worker 状态保留**、降级 |
 
 ### 黄金用例：把已验证的行为固化下来
 
@@ -539,6 +599,7 @@ data: {"type":"done","thread_id":"demo-1"}
 ```
 enterprise-service-agent/
 ├── data/
+│   ├── runtime/                    💾 运行时数据（SQLite 会话库，已忽略）
 │   └── docs/                       📚 知识库（Markdown 即知识源）
 │       ├── account_faq.md          账号排障：401 / 403 / 密码锁定
 │       └── refund_policy.md        退款政策与工单流转规范
@@ -547,13 +608,14 @@ enterprise-service-agent/
 │   ├── tools/
 │   │   └── customer_service_tools.py   🔧 @tool 业务工具
 │   ├── agent/
-│   │   └── customer_agent.py           🧠 LangGraph 状态机 + System Prompt
+│   │   ├── customer_agent.py           🧠 LangGraph 状态机 + System Prompt
+│   │   └── checkpointer.py             💾 检查点后端工厂（sqlite / memory）
 │   └── api/
 │       ├── main.py                     ⚡ FastAPI + SSE + 静态挂载
 │       ├── smoke_sse.py                🧪 流式接口冒烟脚本（目视，无断言）
 │       └── static/index.html           🖥️ Web 工作台（单文件，零构建）
 │
-├── tests/                              ✅ pytest 套件（71 用例，默认离线）
+├── tests/                              ✅ pytest 套件（89 用例，默认离线）
 │   ├── README.md                       测试说明与编写约定
 │   ├── conftest.py                     共享 fixtures（模型桩、图实例）
 │   ├── test_tools.py                   工具契约
@@ -715,7 +777,7 @@ python scripts/secret_scan.py --history      # 扫全部历史提交
 | 多轮上下文 | 同 `thread_id` 跨轮槽位累积，历史 4 条消息完整保留 |
 | 异常兜底 | 强制 `astream` 抛错 → 正确推送 `{"type":"error"}` |
 | 参数校验 | 空 `message` → HTTP 422 |
-| **pytest 套件** | **71 用例通过**（默认 mock 离线）；真实模型用例 **3 用例通过** |
+| **pytest 套件** | **89 用例通过**（默认 mock 离线）；真实模型用例 **3 用例通过** |
 | 密钥扫描器 | 6 类真实密钥样本全部拦截；`your_key_here` 等占位符零误报 |
 | 仓库密钥自检 | `--all` 与 `--history` 均通过 —— **密钥从未进入 git 历史** |
 

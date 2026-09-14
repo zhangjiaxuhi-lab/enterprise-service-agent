@@ -25,6 +25,7 @@
 - [系统架构](#系统架构)
 - [功能演示](#功能演示)
 - [快速开始](#快速开始)
+- [测试体系](#测试体系)
 - [流式协议](#流式协议)
 - [项目结构](#项目结构)
 - [关键设计决策](#关键设计决策)
@@ -74,7 +75,7 @@
 flowchart TB
     subgraph Client["🖥️ 客户端层"]
         UI["Web 工作台<br/>单文件原生 HTML/JS<br/>打字机渲染 · 工具卡片"]
-        CLI["终端脚本<br/>test_sse.py · curl"]
+        CLI["冒烟脚本 / curl<br/>smoke_sse.py"]
     end
 
     subgraph API["⚡ 服务层 · FastAPI"]
@@ -307,10 +308,10 @@ sequenceDiagram
                )                                   ← 描述跨轮累积，未丢失原始诉求
 ```
 
-### 终端流式验证
+### 终端流式验证（冒烟）
 
 ```console
-$ python src/api/test_sse.py
+$ python src/api/smoke_sse.py
 ==========================================================================
 健康检查：status=ok | graph_ready=True | model_mode=dashscope
 ==========================================================================
@@ -329,16 +330,19 @@ $ python src/api/test_sse.py
   [token]      '非常理解您希望尽快处理这件事，为了准确为您提交工单，还需要您补充以下信息：…'
   [done]       thread_id=sse-test-2
   事件序列：token → done
-  ✅ 校验通过：未触发工具，符合槽位填充约束
+  ℹ 未触发工具
 
 【场景3 参数齐备提交】thread_id=sse-test-3
   [tool_start] submit_ticket  args={"user_id": "U-987654", "issue_type": "refund", …}
   [tool_end]   submit_ticket  output(489 字符) '{"success": true, "ticket_id": "TK-2026-9289", …'
   [token]      '已为您成功提交工单，工单号 **TK-2026-9289**，当前状态「待受理」…'
   [done]       thread_id=sse-test-3
-  ✅ 校验通过：已调用 submit_ticket
+  ℹ 已调用 submit_ticket
 ==========================================================================
 ```
+
+> 冒烟脚本只做目视提示（`ℹ` / `⚠`），**不做断言**。严格的行为校验由 `pytest` 承担，
+> 见 [测试体系](#测试体系)。
 
 ---
 
@@ -383,13 +387,20 @@ python -m src.api.main
 
 ### 4. 验证
 
-**方式一：一行命令跑完三个场景**（含断言，退出码 0 即通过）
+**方式一：自动化测试（推荐，含断言）**
 
 ```bash
-python src/api/test_sse.py
+pytest                    # 71 个用例，默认离线（mock 模型），约 8 秒
+pytest -m real_model      # 额外验证真实 qwen-plus 是否遵守 Prompt（需 API Key）
 ```
 
-**方式二：curl**
+**方式二：冒烟脚本（人眼观察流式输出）**
+
+```bash
+python src/api/smoke_sse.py     # 需先启动服务；仅目视确认，不做断言
+```
+
+**方式三：curl**
 
 ```bash
 curl -N -X POST http://127.0.0.1:8000/api/chat/stream \
@@ -399,7 +410,7 @@ curl -N -X POST http://127.0.0.1:8000/api/chat/stream \
 
 > PowerShell 下 `-d '{...}'` 会被引号解析破坏，建议写入文件后 `-d "@$env:TEMP\body.json"`。
 
-**方式三：直接用状态机**（不经 HTTP 层）
+**方式四：直接用状态机**（不经 HTTP 层）
 
 ```bash
 python -m src.agent.customer_agent
@@ -416,6 +427,63 @@ CUSTOMER_AGENT_MOCK=1 python -m src.api.main
 # Windows PowerShell
 $env:CUSTOMER_AGENT_MOCK="1"; python -m src.api.main
 ```
+
+---
+
+## 🧪 测试体系
+
+```bash
+pytest                    # 71 个用例，默认离线，约 8 秒
+pytest -v                 # 显示用例名
+pytest -m real_model      # 额外跑真实模型用例（需 API Key）
+```
+
+| 层级 | 文件 | 覆盖 |
+|---|---|---|
+| 工具契约 | `tests/test_tools.py` | 参数校验、输出格式、检索正确性、**缺参不得静默成功** |
+| 状态机 | `tests/test_agent_graph.py` | 路由层单测 + **黄金用例** + 多轮上下文 |
+| API | `tests/test_api.py` | HTTP 路由、入参校验、**SSE 事件协议契约**、前端契约 |
+
+### 黄金用例：把已验证的行为固化下来
+
+这是本测试体系的核心 —— 后续改 Prompt / 换模型 / 调检索时，
+**跑一次就知道有没有改坏**：
+
+| 守护的约束 | 用例 |
+|---|---|
+| 查询类意图必须检索知识库 | 5 种问法 |
+| **缺参绝不调用工具** | 4 种问法 |
+| 槽位齐备必须提单且分类正确 | 3 类诉求（退款/买错/投诉） |
+| 任何调用不得携带占位符参数 | `test_forbidden_placeholder_values_rejected` |
+| 工具结果必须回边、由模型转写为自然语言 | `test_follows_tool_call_with_natural_language` |
+| 多轮补槽后应自动提单 | `test_second_turn_submits_after_supplying_user_id` |
+| 会话线程互相隔离 | `test_threads_are_isolated` |
+| SSE 事件顺序与字段契约 | `TestSSEProtocol`（8 个用例） |
+
+### mock 与真实模型：两种不同的证明力
+
+|  | mock 模型（默认） | 真实 `qwen-plus`（`-m real_model`） |
+|---|---|---|
+| 联网 / 耗额度 | 否 / 否 | 是 / 是 |
+| 进 CI | ✅ | ❌ 默认跳过 |
+| **能证明** | 图结构、条件边路由、状态归并、**槽位判定逻辑** | **模型是否真的遵守 Prompt** |
+| **不能证明** | 真实模型的行为 | — |
+
+> 两者不可互相替代。mock 复刻的是「规则」，真实模型测试验证的是「规则是否被遵守」。
+> 项目中曾出现真实模型把「诉求已齐备」误判为「还需追问订单号」而**不触发工单**，
+> 这类问题只有真实模型测试能发现 —— 它现在已被 `test_complete_slot_submits_ticket` 守住。
+
+### 与冒烟脚本的分工
+
+|  | `src/api/smoke_sse.py` | `pytest` |
+|---|---|---|
+| 目的 | 人眼观察流式输出 | 自动判定行为正确 |
+| 断言 | 无 | 有 |
+| 需启动服务 | 是 | 否（进程内） |
+| 进 CI | 否 | 是 |
+
+> 命名刻意区分：**叫 `test_` 的文件才应含断言**。冒烟脚本放在 `src/api/` 下并命名为
+> `smoke_sse.py`，避免被误认为测试覆盖。
 
 ---
 
@@ -482,8 +550,15 @@ enterprise-service-agent/
 │   │   └── customer_agent.py           🧠 LangGraph 状态机 + System Prompt
 │   └── api/
 │       ├── main.py                     ⚡ FastAPI + SSE + 静态挂载
-│       ├── test_sse.py                 🧪 流式接口终端验证
+│       ├── smoke_sse.py                🧪 流式接口冒烟脚本（目视，无断言）
 │       └── static/index.html           🖥️ Web 工作台（单文件，零构建）
+│
+├── tests/                              ✅ pytest 套件（71 用例，默认离线）
+│   ├── README.md                       测试说明与编写约定
+│   ├── conftest.py                     共享 fixtures（模型桩、图实例）
+│   ├── test_tools.py                   工具契约
+│   ├── test_agent_graph.py             状态机 + 黄金用例
+│   └── test_api.py                     HTTP + SSE 协议契约
 │
 ├── scripts/
 │   ├── secret_scan.py              🔒 密钥扫描器（钩子与 CI 共用）
@@ -640,6 +715,7 @@ python scripts/secret_scan.py --history      # 扫全部历史提交
 | 多轮上下文 | 同 `thread_id` 跨轮槽位累积，历史 4 条消息完整保留 |
 | 异常兜底 | 强制 `astream` 抛错 → 正确推送 `{"type":"error"}` |
 | 参数校验 | 空 `message` → HTTP 422 |
+| **pytest 套件** | **71 用例通过**（默认 mock 离线）；真实模型用例 **3 用例通过** |
 | 密钥扫描器 | 6 类真实密钥样本全部拦截；`your_key_here` 等占位符零误报 |
 | 仓库密钥自检 | `--all` 与 `--history` 均通过 —— **密钥从未进入 git 历史** |
 
@@ -654,6 +730,8 @@ python scripts/secret_scan.py --history      # 扫全部历史提交
 - **前端为单文件原生实现**，仅在开发环境手工验证；未做多浏览器兼容性回归。
 - **知识库检索为关键词匹配**，不含语义理解（见[设计决策 3](#3-关键词检索但保留标题上下文)）。
 - **工单为模拟提交**，`submit_ticket` 不产生真实网络请求，仅生成流水号并返回结构化 JSON。
+- **测试默认走 mock 模型**：真实模型用例需 API Key，默认不跑。已配置 Key 时可执行
+  `pytest -m real_model` 验证真实模型是否遵守 Prompt 约束。
 
 ---
 

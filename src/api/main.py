@@ -32,7 +32,7 @@ import os
 import sys
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -54,6 +54,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 load_dotenv(dotenv_path=_PROJECT_ROOT / ".env", override=False)
 
+from src.agent import checkpointer as checkpointer_mod  # noqa: E402
 from src.agent.customer_agent import (  # noqa: E402
     NODE_AGENT,
     TOOLS,
@@ -89,16 +90,20 @@ SSE_HEADERS: dict[str, str] = {
 
 class _AppState:
     """
-    持有编译后的图实例与持久化检查点。
+    持有编译后的图实例与检查点。
 
     图在 FastAPI ``lifespan`` 启动阶段构建一次并复用，避免每个请求
-    重复编译图（编译本身有开销，且能保证 MemorySaver 会话不丢失）。
+    重复编译图（编译本身有开销，且能保证会话状态连续）。
     """
 
     def __init__(self) -> None:
         self.graph: Any | None = None
         self.checkpointer: Any | None = None
         self.init_error: str | None = None
+        #: 检查点后端名称（sqlite / memory），用于 /health 暴露
+        self.checkpoint_backend: str = "unknown"
+        #: 非空表示发生降级（如 sqlite 不可用 -> memory）
+        self.checkpoint_degraded: str | None = None
 
     @property
     def ready(self) -> bool:
@@ -117,19 +122,34 @@ def _use_mock() -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
-    应用生命周期：启动时构建状态机，关闭时释放引用。
+    应用生命周期：启动时构建检查点与状态机，关闭时释放。
+
+    检查点默认使用 SQLite 落盘（``CHECKPOINT_BACKEND=sqlite``），使会话状态
+    在进程重启后仍可恢复，并支持多 worker 共享同一份状态；sqlite 不可用时
+    自动降级为内存模式，并把原因记录到 ``state.checkpoint_degraded``
+    （由 ``/health`` 暴露，不静默）。
 
     构建失败（如缺少 API Key）不会阻止服务启动，而是记录错误并在
-    请求时以 ``error`` 事件优雅告知调用方，便于前端拿到明确提示。
+    请求时以 ``error`` 事件优雅告知调用方。
     """
-    try:
-        from langgraph.checkpoint.memory import MemorySaver
+    factory = checkpointer_mod.CheckpointerFactory()
+    # 检查点的生命周期跨越整个应用运行期，用 ExitStack 显式托管
+    stack = AsyncExitStack()
 
-        state.checkpointer = MemorySaver()
+    try:
+        checkpointer = await stack.enter_async_context(factory.open_async())
+        state.checkpointer = checkpointer
+        state.checkpoint_backend = factory.effective_backend
+        state.checkpoint_degraded = factory.degraded_reason
+
         model = build_model(mock=_use_mock())
-        state.graph = build_graph(model=model, checkpointer=state.checkpointer)
+        state.graph = build_graph(model=model, checkpointer=checkpointer)
+
         mode = "mock" if _use_mock() else "dashscope"
-        print(f"[启动] 客服智能体图构建成功（模型模式：{mode}）")
+        print(
+            f"[启动] 客服智能体图构建成功（模型模式：{mode}，"
+            f"检查点：{state.checkpoint_backend}）"
+        )
     except Exception as error:  # noqa: BLE001 - 启动阶段需捕获全部异常
         state.graph = None
         state.init_error = f"{type(error).__name__}: {error}"
@@ -140,6 +160,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         state.graph = None
         state.checkpointer = None
+        # 释放检查点连接（sqlite 需显式关闭）
+        await stack.aclose()
 
 
 app = FastAPI(
@@ -397,12 +419,15 @@ async def health() -> dict[str, Any]:
     返回服务与状态机就绪情况，便于容器探针与联调自检。
 
     Returns:
-        dict: 包含 ``status``、``graph_ready``、``tools``、``init_error``。
+        dict: 含 ``status``、``graph_ready``、``checkpoint_backend``、
+            ``checkpoint_degraded``、``tools``、``init_error``。
     """
     return {
         "status": "ok" if state.ready else "degraded",
         "graph_ready": state.ready,
         "model_mode": "mock" if _use_mock() else "dashscope",
+        "checkpoint_backend": state.checkpoint_backend,
+        "checkpoint_degraded": state.checkpoint_degraded,
         "tools": [tool.name for tool in TOOLS],
         "init_error": state.init_error,
     }
@@ -497,7 +522,9 @@ async def chat_history(thread_id: str) -> dict[str, Any]:
         )
 
     config = {"configurable": {"thread_id": thread_id}}
-    snapshot = state.graph.get_state(config)
+    # 必须使用异步接口：AsyncSqliteSaver 不支持同步 get_state，
+    # 在主线程同步调用会抛 InvalidStateError。
+    snapshot = await state.graph.aget_state(config)
     raw_messages: list[BaseMessage] = list(snapshot.values.get("messages", []))
 
     def _role(item: BaseMessage) -> str:

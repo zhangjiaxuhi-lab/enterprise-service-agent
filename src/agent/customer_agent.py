@@ -723,10 +723,17 @@ def main() -> int:
         print(f"\n[启动失败] {error}\n")
         return 2
 
-    # MemorySaver 让每个场景拥有独立线程的多轮上下文
-    from langgraph.checkpoint.memory import MemorySaver
+    # 本测试入口刻意使用**内存**检查点，而非默认的 sqlite 后端。
+    #
+    # 原因：三个场景固定复用 thread_id（scenario-1/2/3），若落盘持久化，
+    # 重复运行会不断累积历史 —— 第 2 次运行时场景 1 的「历史」里已含上一轮
+    # 的工单与提问，输出将不可复现，演示与排查都会失真。
+    #
+    # 需要验证持久化行为请运行测试套件：pytest tests/test_checkpointer.py
+    # 生产服务（src/api/main.py）走默认 sqlite 后端，由 CHECKPOINT_BACKEND 控制。
+    from src.agent.checkpointer import build_sync_checkpointer
 
-    app = build_graph(model=model, checkpointer=MemorySaver())
+    app = build_graph(model=model, checkpointer=build_sync_checkpointer(backend="memory"))
 
     for index, (title, question) in enumerate(TEST_SCENARIOS, start=1):
         print(f"\n{'─' * 78}")

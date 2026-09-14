@@ -1,0 +1,54 @@
+# ---- 环境变量与密钥 ----
+.env
+.env.local
+.env.*.local
+*.key
+
+# ---- Python 运行时产物 ----
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+*$py.class
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# ---- 打包与构建产物 ----
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+.eggs/
+
+# ---- 测试与覆盖率 ----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 编辑器与 IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 日志与本地运行数据 ----
+*.log
+logs/
+data/runtime/

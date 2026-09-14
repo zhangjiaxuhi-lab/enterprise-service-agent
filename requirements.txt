@@ -1,0 +1,48 @@
+# ============================================================
+# 企业级智能客服与工单协同中枢 - 依赖清单
+# 安装: pip install -r requirements.txt
+# ============================================================
+#
+# 【重要】版本区间经过实际验证，请勿随意放宽：
+#
+#  1. langsmith 必须 < 0.4
+#     0.4.0 起 langsmith/_internal/_uuid.py 硬依赖 uuid_utils（Rust 原生扩展）。
+#     若机器启用 Windows 应用程序控制策略（WDAC/AppLocker），该未签名 .pyd
+#     会被拦截，报错：
+#       ImportError: DLL load failed while importing _uuid_utils
+#     由于 langchain_core.runnables 会间接导入 langsmith，
+#     一旦触发将导致 langgraph / langchain-openai 全面无法导入。
+#
+#  2. langgraph 保持 0.2.x
+#     langgraph 1.x（配 langgraph-checkpoint 4.x）要求 langchain-core >= 1.x，
+#     与下方的 0.3.x 组合冲突，会出现：
+#       TypeError: Reviver.__init__() got an unexpected keyword argument 'allowed_objects'
+#
+# 当前已验证通过的组合：
+#   langchain-core 0.3.79 / langgraph 0.2.76 / langchain-openai 0.2.14
+#   langgraph-checkpoint 2.1.2 / langgraph-prebuilt 0.1.8 / langsmith 0.3.45
+# ============================================================
+
+# ---- LangChain 核心与生态 ----
+langchain>=0.3,<0.4
+langchain-core>=0.3.72,<0.3.80
+langchain-community>=0.3,<0.4
+langchain-text-splitters>=0.3,<0.4
+
+# ---- 官方 OpenAI 兼容客户端（对接 DashScope 兼容模式） ----
+langchain-openai>=0.2,<0.3
+openai>=1.40,<2.0
+
+# ---- 状态机编排（LangGraph） ----
+langgraph>=0.2,<0.3
+langgraph-checkpoint>=2.0,<3.0
+langgraph-prebuilt>=0.1.5,<0.2
+
+# ---- 追踪依赖：务必 < 0.4，见上方说明 1 ----
+langsmith>=0.3,<0.4
+
+# ---- 配置与数据校验 ----
+python-dotenv>=1.0.0
+pydantic>=2.7,<3.0
+pydantic-settings>=2.3.0
+typing-extensions>=4.12.0

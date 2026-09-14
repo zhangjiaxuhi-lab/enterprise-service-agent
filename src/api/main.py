@@ -39,7 +39,8 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from pydantic import BaseModel, Field
 
@@ -67,6 +68,10 @@ from src.agent.customer_agent import (  # noqa: E402
 
 API_HOST: str = "0.0.0.0"
 API_PORT: int = 8000
+
+# 前端静态资源目录（第四阶段：可视化 Web 工作台）
+STATIC_DIR: Path = Path(__file__).resolve().parent / "static"
+INDEX_FILE: Path = STATIC_DIR / "index.html"
 
 # SSE 响应头：禁用各类缓冲，保证事件实时到达客户端
 SSE_HEADERS: dict[str, str] = {
@@ -153,6 +158,47 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# 前端静态资源挂载（第四阶段：Web 可视化工作台）
+# ---------------------------------------------------------------------------
+#
+# 挂载顺序说明：本块位于所有 API 路由**之前**，但 StaticFiles 只会匹配
+# /static 前缀，而 /、/health、/api/* 均为独立路由，因此不会遮蔽既有接口。
+# 换言之，/api/chat/stream 的协议与行为完全不受影响。
+#
+# 若静态目录不存在（例如仅部署后端），跳过挂载并给出提示，
+# 不影响 API 服务正常启动。
+
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+else:  # pragma: no cover - 部署形态差异
+    print(f"[启动] 未找到静态目录 {STATIC_DIR}，跳过前端挂载（API 不受影响）")
+
+
+@app.get("/", include_in_schema=False)
+async def index() -> Any:
+    """
+    根路径返回 Web 工作台页面。
+
+    使用 ``FileResponse`` 直接返回单个 HTML 文件（前端为单文件实现，
+    无构建产物、无外部依赖目录）。
+
+    Returns:
+        FileResponse | dict: 正常返回页面；文件缺失时返回提示信息。
+    """
+    if not INDEX_FILE.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="前端页面未找到，请确认 src/api/static/index.html 存在。",
+        )
+    # 开发阶段禁用缓存，避免改动页面后浏览器仍使用旧版本
+    return FileResponse(
+        INDEX_FILE,
+        media_type="text/html; charset=utf-8",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +535,9 @@ def main() -> int:
     """
     import uvicorn
 
-    print(f"启动服务：http://127.0.0.1:{API_PORT}  (文档：/docs)")
+    print(f"客服工作台：http://127.0.0.1:{API_PORT}/")
+    print(f"接口文档：  http://127.0.0.1:{API_PORT}/docs")
+    print(f"SSE 接口：  http://127.0.0.1:{API_PORT}/api/chat/stream")
     uvicorn.run(
         "src.api.main:app",
         host=API_HOST,

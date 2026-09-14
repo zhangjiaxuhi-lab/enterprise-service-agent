@@ -42,10 +42,11 @@ SQLite 初始化失败（如目录只读、磁盘满）时**自动降级为 memo
 from __future__ import annotations
 
 import os
-import sys
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any
+
+from src.observability.logging import get_logger
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -240,10 +241,9 @@ class CheckpointerFactory:
                     from langgraph.checkpoint.memory import MemorySaver
 
                     self.degraded_reason = f"{type(error).__name__}: {error}"
-                    print(
-                        "[检查点] sqlite 初始化失败，已降级为内存模式"
-                        f"（重启将丢失上下文）：{self.degraded_reason}",
-                        file=sys.stderr,
+                    get_logger("checkpointer").warning(
+                        "sqlite 初始化失败，已降级为内存模式（重启将丢失上下文）",
+                        extra={"degraded_reason": self.degraded_reason},
                     )
                     checkpointer = MemorySaver()
 

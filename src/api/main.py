@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -37,9 +38,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from pydantic import BaseModel, Field
@@ -62,6 +63,23 @@ from src.agent.customer_agent import (  # noqa: E402
     build_graph,
     build_model,
 )
+from src.observability import (  # noqa: E402
+    bind_request_context,
+    configure_tracing,
+    get_logger,
+    get_request_id,
+    new_request_id,
+    reset_request_context,
+    setup_logging,
+    trace_config,
+)
+
+# 初始化日志（幂等）；此后本模块统一使用 logger，不再 print 到 stdout
+setup_logging()
+logger = get_logger("api")
+
+#: 请求 ID 透传的响应头名称
+REQUEST_ID_HEADER: str = "X-Request-ID"
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -104,6 +122,8 @@ class _AppState:
         self.checkpoint_backend: str = "unknown"
         #: 非空表示发生降级（如 sqlite 不可用 -> memory）
         self.checkpoint_degraded: str | None = None
+        #: 链路追踪状态摘要（由 configure_tracing 填充）
+        self.tracing: dict[str, Any] = {"enabled": False, "reason": "未初始化"}
 
     @property
     def ready(self) -> bool:
@@ -136,6 +156,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 检查点的生命周期跨越整个应用运行期，用 ExitStack 显式托管
     stack = AsyncExitStack()
 
+    # 链路追踪（可选；未配置 Key 时自动跳过，不产生噪音）
+    state.tracing = configure_tracing()
+
     try:
         checkpointer = await stack.enter_async_context(factory.open_async())
         state.checkpointer = checkpointer
@@ -146,14 +169,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         state.graph = build_graph(model=model, checkpointer=checkpointer)
 
         mode = "mock" if _use_mock() else "dashscope"
-        print(
-            f"[启动] 客服智能体图构建成功（模型模式：{mode}，"
-            f"检查点：{state.checkpoint_backend}）"
+        logger.info(
+            "客服智能体图构建成功",
+            extra={
+                "model_mode": mode,
+                "checkpoint_backend": state.checkpoint_backend,
+                "tracing": state.tracing.get("enabled", False),
+            },
         )
+        if state.checkpoint_degraded:
+            logger.warning(
+                "检查点已降级为内存模式，重启将丢失会话上下文",
+                extra={"degraded_reason": state.checkpoint_degraded},
+            )
     except Exception as error:  # noqa: BLE001 - 启动阶段需捕获全部异常
         state.graph = None
         state.init_error = f"{type(error).__name__}: {error}"
-        print(f"[启动] 图构建失败：{state.init_error}")
+        logger.error("图构建失败", extra={"init_error": state.init_error})
 
     try:
         yield
@@ -183,6 +215,64 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
+# 可观测性中间件：请求 ID 透传 + 访问日志
+# ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def observability_middleware(request: Request, call_next: Any) -> Response:
+    """
+    为每个请求绑定 ``request_id``、记录访问日志，并在响应头回传该 ID。
+
+    行为：
+        * 优先复用调用方传入的 ``X-Request-ID``（便于跨服务串联链路），
+          否则自动生成；
+        * 绑定到 ``contextvars``，此后该请求产生的**每一条日志**都会自动带上
+          ``request_id``，无需逐层传参；
+        * 响应头回传 ``X-Request-ID``，前端可据此上报问题、便于定位日志。
+
+    Args:
+        request: 入站请求。
+        call_next: 下游处理链。
+
+    Returns:
+        Response: 下游响应（附带 ``X-Request-ID``）。
+    """
+    request_id = request.headers.get(REQUEST_ID_HEADER, "").strip() or new_request_id()
+    tokens = bind_request_context(request_id=request_id)
+    started = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        # 未捕获异常也要留下带 request_id 的记录，否则线上无从排查
+        logger.exception(
+            "请求处理异常",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+            },
+        )
+        reset_request_context(tokens)
+        raise
+
+    duration_ms = round((time.perf_counter() - started) * 1000, 2)
+    response.headers[REQUEST_ID_HEADER] = request_id
+    logger.info(
+        "请求完成",
+        extra={
+            "method": request.method,
+            "path": request.url.path,
+            "status": response.status_code,
+            "duration_ms": duration_ms,
+        },
+    )
+    reset_request_context(tokens)
+    return response
+
+
+# ---------------------------------------------------------------------------
 # 前端静态资源挂载（第四阶段：Web 可视化工作台）
 # ---------------------------------------------------------------------------
 #
@@ -196,7 +286,7 @@ app.add_middleware(
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 else:  # pragma: no cover - 部署形态差异
-    print(f"[启动] 未找到静态目录 {STATIC_DIR}，跳过前端挂载（API 不受影响）")
+    logger.warning("未找到静态目录，跳过前端挂载（API 不受影响）", extra={"static_dir": str(STATIC_DIR)})
 
 
 @app.get("/", include_in_schema=False)
@@ -326,7 +416,16 @@ async def event_stream(
     Yields:
         str: SSE 报文片段。
     """
-    config = {"configurable": {"thread_id": thread_id}}
+    # configurable 承载会话隔离；metadata 让 trace 可按会话/请求检索。
+    # trace_config 在追踪关闭时只返回 metadata（无副作用），因此无需分支判断。
+    config: dict[str, Any] = {
+        "configurable": {"thread_id": thread_id},
+        **trace_config(
+            thread_id=thread_id,
+            request_id=get_request_id(),
+            run_name="chat_stream",
+        ),
+    }
     # 已推送过内容的 AI 消息 id，用于去重补推
     streamed_ai_ids: set[str] = set()
 
@@ -399,6 +498,11 @@ async def event_stream(
         yield sse_event({"type": "done", "thread_id": thread_id})
 
     except Exception as error:  # noqa: BLE001 - 流式中任何异常都要以 error 事件收尾
+        # 记录到日志（带 request_id / thread_id），同时仍以 error 事件收尾
+        logger.exception(
+            "SSE 流处理失败",
+            extra={"thread_id": thread_id, "error_type": type(error).__name__},
+        )
         yield sse_event(
             {
                 "type": "error",
@@ -420,7 +524,7 @@ async def health() -> dict[str, Any]:
 
     Returns:
         dict: 含 ``status``、``graph_ready``、``checkpoint_backend``、
-            ``checkpoint_degraded``、``tools``、``init_error``。
+            ``checkpoint_degraded``、``tracing``、``tools``、``init_error``。
     """
     return {
         "status": "ok" if state.ready else "degraded",
@@ -428,6 +532,7 @@ async def health() -> dict[str, Any]:
         "model_mode": "mock" if _use_mock() else "dashscope",
         "checkpoint_backend": state.checkpoint_backend,
         "checkpoint_degraded": state.checkpoint_degraded,
+        "tracing": state.tracing,
         "tools": [tool.name for tool in TOOLS],
         "init_error": state.init_error,
     }
@@ -490,7 +595,14 @@ async def chat_sync(request: ChatRequest) -> ChatSyncResponse:
         )
 
     thread_id = (request.thread_id or "").strip() or f"session-{uuid.uuid4().hex[:12]}"
-    config = {"configurable": {"thread_id": thread_id}}
+    config: dict[str, Any] = {
+        "configurable": {"thread_id": thread_id},
+        **trace_config(
+            thread_id=thread_id,
+            request_id=get_request_id(),
+            run_name="chat_sync",
+        ),
+    }
     result = await state.graph.ainvoke(
         {"messages": [HumanMessage(content=request.message)]}, config=config
     )
@@ -562,9 +674,14 @@ def main() -> int:
     """
     import uvicorn
 
-    print(f"客服工作台：http://127.0.0.1:{API_PORT}/")
-    print(f"接口文档：  http://127.0.0.1:{API_PORT}/docs")
-    print(f"SSE 接口：  http://127.0.0.1:{API_PORT}/api/chat/stream")
+    logger.info(
+        "服务启动",
+        extra={
+            "workbench": f"http://127.0.0.1:{API_PORT}/",
+            "docs": f"http://127.0.0.1:{API_PORT}/docs",
+            "sse": f"http://127.0.0.1:{API_PORT}/api/chat/stream",
+        },
+    )
     uvicorn.run(
         "src.api.main:app",
         host=API_HOST,

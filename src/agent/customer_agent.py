@@ -595,17 +595,35 @@ class _MockToolCallingModel:
         """
         判断用户描述是否足够构成工单描述。
 
+        判定为两步，避免只覆盖某一类场景：
+
+        1. 长度达标（过滤「太短」这类无信息量的输入）；
+        2. 能识别出**诉求** —— 或命中通用办理类意图关键词（投诉/报障/退款…），
+           或命中描述性细节词（订单号/时间/规格等）。
+
+        早期实现只用了「购买/误选/订单」这类**退款专有**细节词，导致
+        「对服务不满，要投诉」这种描述完整但非退款的诉求被误判为缺失，
+        进而错误地触发反问而**不提交工单**。此处改为覆盖全部工单类型。
+
         Args:
-            text: 用户输入。
+            text: 用户输入（多轮场景下为累积文本）。
 
         Returns:
-            bool: 同时包含「具体诉求」与「背景细节」时返回 True。
+            bool: 描述足以构成工单时返回 True。
         """
-        has_detail = any(
-            k in text
-            for k in ("购买", "买错", "误选", "订单", "年费", "套餐", "昨天", "昨天购买", "双份")
+        if len(text) < 12:
+            return False
+
+        # 诉求信号一：通用办理类意图关键词，覆盖退款/投诉/报障/账单等全部枚举
+        if any(keyword in text for keyword in _TICKET_INTENT_KEYWORDS):
+            return True
+
+        # 诉求信号二：描述性细节词（用于「没写明办理动词、但有具体线索」的输入）
+        detail_markers = (
+            "购买", "买错", "误选", "订单", "年费", "套餐", "双份", "扣费",
+            "付款", "支付", "发票", "账单", "登录", "密码", "权限", "故障",
         )
-        return has_detail and len(text) >= 12
+        return any(marker in text for marker in detail_markers)
 
     @staticmethod
     def _summarize_tool_result(message: ToolMessage) -> str:

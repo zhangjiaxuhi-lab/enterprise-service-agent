@@ -12,8 +12,11 @@ pytest 配置与共享 fixtures。
 
 from __future__ import annotations
 
+import shutil
 import sys
+import uuid
 from pathlib import Path
+from typing import Iterator
 
 import pytest
 
@@ -35,6 +38,59 @@ if str(_PROJECT_ROOT) not in sys.path:
 #
 # 默认测试全部使用注入的 mock 模型，不需要任何 Key；
 # 只有 real_model 用例需要真实 Key，而它由 .env 提供。
+
+
+# ---------------------------------------------------------------------------
+# 临时目录
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tmp_dir() -> Iterator[Path]:
+    """
+    提供临时目录（自管理，不经过 pytest 的 tmp_path 机制）。
+
+    为什么不用内置的 ``tmp_path``：pytest 会在会话结束时扫描其 basetemp 目录
+    （``cleanup_dead_symlinks``），而部分受限/沙箱化文件系统会拒绝该目录枚举，
+    导致**全部用例通过但退出码非 0**，CI 误判失败。本 fixture 自行创建与清理，
+    行为等价且不依赖 pytest 的临时目录插件。
+
+    目录建在项目根目录下（而非系统 %TEMP%），因为受限环境常禁止写入系统
+    临时目录。
+
+    刻意用 ``pathlib.mkdir`` 而非 ``tempfile.mkdtemp``：后者以 ``0o700``
+    模式创建目录，在此类受限文件系统上会导致 SQLite 无法在其中创建数据库
+    （``OperationalError: unable to open database file``）。``mkdir`` 走默认
+    ACL，实测可用。
+
+    Yields:
+        Path: 新建的空目录，测试结束后自动删除。
+    """
+    path = _PROJECT_ROOT / f"tdata_{uuid.uuid4().hex[:10]}"
+    path.mkdir(parents=True)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 异步测试支持
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    """
+    指定 anyio 使用的异步后端。
+
+    仅测试 asyncio —— 生产运行时（FastAPI/uvicorn）也基于 asyncio，
+    无需为 trio 重复跑一遍，可减少一半用例耗时。
+
+    Returns:
+        str: 后端名称。
+    """
+    return "asyncio"
 
 
 # ---------------------------------------------------------------------------

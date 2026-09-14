@@ -30,7 +30,11 @@ from src.api.main import INDEX_FILE, STATIC_DIR, app, event_stream
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> Any:
     """
-    进程内 HTTP 客户端（mock 模型模式，不联网）。
+    进程内 HTTP 客户端（mock 模型 + 内存检查点，不联网、不落盘）。
+
+    刻意把检查点设为 ``memory``：测试不应在 ``data/runtime/`` 生成数据库文件，
+    也不应依赖上一条用例遗留的会话状态。SQLite 后端由
+    ``tests/test_checkpointer.py`` 单独验证。
 
     Args:
         monkeypatch: pytest 环境变量补丁。
@@ -39,6 +43,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Any:
         TestClient: 已进入 lifespan 的客户端。
     """
     monkeypatch.setenv("CUSTOMER_AGENT_MOCK", "1")
+    monkeypatch.setenv("CHECKPOINT_BACKEND", "memory")
     with TestClient(app) as test_client:
         yield test_client
 

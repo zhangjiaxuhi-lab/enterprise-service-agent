@@ -29,6 +29,10 @@ wheels/
 
 # ---- 测试与覆盖率 ----
 .pytest_cache/
+_pytmp/
+pytest_tmp/
+# 测试自管理的临时目录（tests/conftest.py 的 tmp_dir fixture）
+tdata_*/
 .coverage
 .coverage.*
 htmlcov/
